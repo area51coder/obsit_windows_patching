@@ -1,0 +1,8 @@
+---
+
+- name: ocb.patching.windows
+  src: https://github.com/area51coder/ocb.patching.windows.git
+  version: v3.0.0
+  scm: git
+
+...
