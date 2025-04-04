@@ -1,0 +1,238 @@
+---
+- hosts: "{{ target }}"
+  pre_tasks:
+    - set_fact:
+        ReportCreationDate: "{{ lookup('pipe','date +%Y-%m-%d-%H-%M-%S') }}"
+      run_once: yes
+      tags: reporting
+  vars:
+    oansiblereportName: "Patching_{{ ReportCreationDate }}"
+    reboot_time: "NA"
+    failure_point: "NA"
+    error: "NA"
+    downloadedKB: "NA"
+    installedKB: "NA"
+    oansiblereportDisplay: true
+    opatchWinWUServer: "none" 
+    opatchWinUpdateCategoryNames: ["CriticalUpdates", "SecurityUpdates", "UpdateRollups", "Application", "Connectors", "Definition Updates", "Developer Kits", "Feature Packs", "Guidance", "Service Packs", "Tools", "Updates"]
+    #opatchWinDoNotConnectToWindowsUpdateInternetLocations: 1
+    #opatchWinNoAutoRebootWithLoggedOnUsers: 1
+
+
+  tasks:
+     #Perform Download/Patch
+    - block:
+        #Start required services
+      - name: Start required services
+        win_servicer
+          name: "{{ item }}"
+          state: started
+        loop:
+          - BITS     # Background Intelligent Transfer Service
+          - wuauserv  #windows update service
+        tags:
+          - download
+          - update
+
+      #Include Patching Role for Windows in case of Download
+      - name: Include Patching Role for Windows in case of Download
+        include_role:
+          name: ocb.patching.windows
+        tags:
+          - download
+        
+        #Display details for searched / Downloaded packages
+      - name: Display details for searched / Downloaded packages
+        debug:
+          msg: " Searched pakages details [ Title , category ] : {{__searched.updates | json_query('*.[title,categories]') }}"
+        when: __searched is defined and __searched.found_update_count > 0
+        tags:
+          - download
+
+       #Show details of downloaded packages
+      - name: Show details of downloaded packages
+        debug:
+          msg: "Downloaded pakages details [ Title , category ] : {{ __downloaded.updates | json_query('*.[title,categories]') }}"
+        when: __downloaded.updates is defined and __downloaded.found_update_count > 0
+        tags:
+          - download
+          - update
+
+        #Include Patching Role for Windows in case of INSTALL
+      - name: Include Patching Role for Windows in case of INSTALL
+        include_role:
+          name: ocb.patching.windows
+        tags:
+          - update
+
+      #Show details of installed packages
+      - name: Show details of installed packages
+        debug:
+          msg: "Installed pakages details [ Title , category ] : {{ __installed.updates | json_query('*.[title,categories]') }}"
+        when: __installed.updates is defined and __installed.found_update_count > 0
+        tags:
+          - update
+
+      #Show details of installed packages On Retry task
+      - name: Show details of installed packages on Retry task
+        debug:
+          msg: "Installed pakages details [ Title , category ] : {{ __retry.updates | json_query('*.[title,categories]') }}"
+        when: __retry.updates is defined and __retry.found_update_count > 0
+        tags:
+          - update
+
+        #Reboot the server if not rebooted after patching attempt
+      #- name: Reboot the server if not rebooted after patching attempt
+      #  win_reboot:
+      #    reboot_timeout: 2700
+      #  when: __installed.reboot_required == False or (__retry.reboot_required is defined and __retry.reboot_required == False)
+      #  tags:
+      #    - update
+
+        #Pause 120 seconds to give time to Auto delay services
+      - name: Pause 120 seconds
+        pause:
+          seconds: 120
+        tags: update
+
+        #check for services having startmode as Auto
+      - name: check for services having startmode as Auto
+        win_shell: "Get-WmiObject win32_service | Where-Object {$_.StartMode -eq 'Auto'} | select -ExpandProperty name"
+        register: __autoServices
+        tags:
+          - update
+
+        #Make sure services having startmode as Auto are running
+      - name: Make sure services having startmode as Auto are running
+        win_service:
+          name: "{{ item }}"
+          state: started
+        loop:
+          "{{ __autoServices.stdout_lines }}"
+        ignore_errors: true   ##
+        tags:
+          - update
+
+    
+      #Run below tasks even in case of any task failure on VM
+      always:
+
+        #set Available_KB
+      - name: set Available_KB for reporting
+        set_fact:
+          #available_KB: "{% if __searched.failed == false %}{{ __searched.updates| json_query('*.kb') }}{% else %}{{'CONNECTION ERROR'}}{% endif %}"
+          available_KB: "{% if __searched.failed is defined and __searched.failed == false %}{{ __searched.updates| json_query('*.kb')|regex_replace(',',':') }}{% else %}{{'CONNECTION ERROR'}}{% endif %}"
+        tags:
+          - reporting
+
+        #set Error values in case of failure before package search attempt
+      - name: set Error values in case of failure package search attempt
+        set_fact:
+          failure_point: "Connectivity failed"
+          error: "Connectivity issue"
+        when: __searched.failed is defined and __searched.failed == true and __searched.msg is not defined
+        tags:
+          - reporting
+
+        #set Error values in case of Search failure
+      - name: set Error values in case of Search failure
+        set_fact:
+          failure_point: "Searching failed"
+          error: "{{ __searched.msg|regex_replace(',',':') }}"
+        when: __searched.failed is defined and __searched.failed == true and __searched.msg is defined
+        tags:
+          - reporting
+
+
+       #Get Downloaded KB for reporting
+      - name: Get Downloaded KB for reporting
+        set_fact:
+          downloadedKB: "{{ __downloaded.updates | json_query('*.kb')|regex_replace(',',':') }}"
+        when: __searched.found_update_count is defined and __downloaded.updates is defined and __downloaded.found_update_count > 0
+        tags:
+          - reporting
+
+        #set Error values in case of Download failure
+      - name: set Error values in case of Download failure
+        set_fact:
+          failure_point: "Downloading failed"
+          error: "{{ __downloaded.msg|regex_replace(',',':') }}"
+        when: __downloaded.failed is defined and __downloaded.failed == true
+        tags:
+          - reporting
+
+       #Get Installed KB for reporting
+      - name: Get Installed KB for reporting
+        set_fact:
+          installedKB: "{{ __installed.updates | json_query('*.kb')|regex_replace(',',':') }}"
+          reboot_time: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+        when: __searched.found_update_count is defined and __installed.updates is defined and __installed.found_update_count > 0
+        tags:
+          - reporting
+
+        #Get Installed KB for reporting if Installion occured on Retry
+      - name: Get Installed KB for reporting if Installion occured on Retry
+        set_fact:
+          installedKB: "{{ __retry.updates | json_query('*.kb')|regex_replace(',',':') }}"
+          reboot_time: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+        when: __searched.found_update_count is defined and __retry.updates is defined and __retry.found_update_count > 0
+        tags:
+          - reporting
+
+        #set Error values in case of Install failure
+      - name: set Error values in case of Install failure
+        set_fact:
+          failure_point: "Installation failed"
+          error: "{{ __retry.msg[:75]|regex_replace(',',':') }}"
+        when: __retry.failed is defined and __retry.failed == true
+        tags:
+          - reporting
+
+        #Run Setup for reporting
+      - name: Run Setup for reporting
+        setup:
+        ignore_errors: true
+        ignore_unreachable: yes
+        register: __setup
+        tags: reporting
+
+        #Set Customer and Project name
+      - name: Set Customer and Project name
+        set_fact:
+          Customer: "AREA51"
+          project: "AREA51-IT"
+        tags: reporting
+        
+        #Get uptime for reporting
+      - name: Get uptime for reporting
+        set_fact:
+          uptime_in_min: "{% if __setup.failed is defined and __setup.failed == false %}{{ (ansible_uptime_seconds / 60) | round|int }}{%else%}{{'CONNECTION ERROR'}}{%endif%}"
+        tags: reporting
+
+        #Give msg on console
+      - name: Give msg on console
+        debug:
+          msg: "{{ ansible_hostname }}/ {{ inventory_hostname }} got last boot on {{ ansible_lastboot }} and is up for {{ uptime_in_min }} minutes"
+        when: __setup.failed is defined and __setup.failed == false
+        tags:
+          - reporting
+
+        #Include role for reporting for installation
+      - name: Include role for reporting for installation
+        include_role:
+          name: ocb.ansiblereport
+          apply: 
+            become: false
+        vars:
+          oansiblereportCsvTemplate: "report.csv.j2"
+          oansiblereportPath: "/tmp"
+          oansiblereportVarslist: [ 'Customer' , 'project' , 'ansible_hostname' , 'ansible_distribution' , 'ansible_architecture' , 'inventory_hostname' , 'available_KB', 'downloadedKB', 'installedKB' , 'failure_point' , 'error' ,'uptime_in_min' , 'reboot_time' ]
+          oansiblereportFrom: "abcd@gmail.com"
+          oansiblereportSmtp: area51.com
+          oansiblereportDestination: "mail"
+          oansiblereportMailBody: "Please find report for Patching including server Reboot in attachment."
+          oansiblereportMailSubject: "AREA51 Patching Report with server Reboot as on - {{ ReportCreationDate }}"
+        tags:
+          - reporting
+
+...
